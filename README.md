@@ -1,4 +1,4 @@
-# All-People-Leaders-Group
+# All People Leaders Group
 Create and maintain an Active Directory group that contains all of an organization's "people leaders."
 
 This PowerShell script will help create and maintain an AD group that contains all of an organization's "people leaders." It is based on querying all Active Directory user objects that have a value in their DirectReports property and then filtering that group by actual leadership/managerial titles. Thoe list of titles can be customized to suit an organization's unique titles.
