@@ -16,6 +16,9 @@
    To Do: Add a parameter and function to create the new group.
 #>
 
+[CmdletBinding(SupportsShouldProcess = $false)]
+param ()
+
 #region Variables
 
     # Set preferred log file path
