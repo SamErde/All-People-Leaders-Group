@@ -1,32 +1,18 @@
 {
-    "version": "0.2",
-    "language": "en",
-    
-    "words": [
-        "RSAT"
-    ],
+  "version": "0.2",
+  "language": "en",
 
-    "ignoreWords": [
-        "stefanzweifel",
-        "diffy"
-    ],
-    
-    "flagWords": [
-        "yeet"
-    ],
+  "words": ["RSAT"],
 
-    "patterns": [
-        {
-          "name": "ALL-CAPS-WORDS",
-          "pattern": "/\b[A-Z0-9]+\b/g",
-          "description": "Any word in ALL CAPS."
-        }
-    ],
+  "ignoreWords": ["stefanzweifel", "diffy"],
 
-    "ignoreRegExpList": [
-        "ALL-CAPS-WORDS",
-        "Email",
-        "github.com/",
-        "@"
-    ]
+  "patterns": [
+    {
+      "name": "ALL-CAPS-WORDS",
+      "pattern": "/\b[A-Z0-9]+\b/g",
+      "description": "Any word in ALL CAPS."
+    }
+  ],
+
+  "ignoreRegExpList": ["ALL-CAPS-WORDS", "Email", "github.com/", "@"]
 }
