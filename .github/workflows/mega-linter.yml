@@ -28,12 +28,21 @@ env:
   APPLY_FIXES_EVENT: pull_request
 
   # If APPLY_FIXES is used, defines if the fixes are directly committed (commit)
-  # or posted in a PR (pull_request)
+  # or posted in a PR (pull_request).
+  #
+  # Only 'commit' is implemented below. Auto-fix commits are pushed with the
+  # job's short-lived GITHUB_TOKEN instead of a long-lived PAT. GitHub
+  # deliberately does not re-trigger workflows for GITHUB_TOKEN pushes, which
+  # removes any risk of a lint/fix/lint loop; the trade-off is that the fix
+  # commit itself is not re-linted until the next human push to the branch.
   APPLY_FIXES_MODE: commit
 
 concurrency:
-  group: ${{ github.ref }}-${{ github.workflow }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  # Keep the last run on a protected branch alive so its reports are published;
+  # feature-branch runs are safe to supersede.
+  cancel-in-progress: >-
+    ${{ !contains(fromJSON('["refs/heads/main", "refs/heads/master"]'), github.ref) }}
 
 permissions:
   contents: read
@@ -42,26 +51,31 @@ jobs:
   megalinter:
     name: MegaLinter
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
-    # Give the default GITHUB_TOKEN write permission to commit and push, comment
-    # issues & post new PR; remove the ones you do not need
+    # GITHUB_TOKEN scopes, matched to the endpoints actually used.
+    # 'issues: write' was removed: this workflow never touches a standalone
+    # issue, and PR comments are authorised by 'pull-requests: write'.
     permissions:
-      contents: write
-      issues: write
-      pull-requests: write
+      contents: write # push auto-fix commits back to the pull request branch
+      pull-requests: write # MegaLinter's pull request comment reporter
 
     steps:
 
       # Git Checkout
       - name: Harden the runner (Audit all outbound calls)
-        uses: step-security/harden-runner@95d9a5deda9de15063e7595e9719c11c38c90ae2 # v2.13.2
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit
 
       - name: Checkout Code
-        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          token: ${{ secrets.PAT || secrets.GITHUB_TOKEN }}
+          # No credentials are written to .git/config, so the linters (and the
+          # third-party tools they shell out to) never run alongside a usable
+          # push token. Push access is granted later, in a guarded step, only
+          # after linting has finished.
+          persist-credentials: false
 
           # If you use VALIDATE_ALL_CODEBASE = true, you can remove this line to
           # improve performance
@@ -105,14 +119,25 @@ jobs:
 
           # Uncomment to disable copy-paste and spell checks
           # DISABLE: COPYPASTE,SPELL
+          # Existing policy: MegaLinter reports findings without failing the
+          # build, so the pre-existing backlog in this repository does not block
+          # merges. Individual linters are promoted to blocking via
+          # <LINTER>_DISABLE_ERRORS: false once their scope is known-clean.
           DISABLE_ERRORS: true
           DISABLE_LINTERS: SPELL_LYCHEE
-          # Uncomment DISABLE_ERRORS_LINTERS if you want to turn errors back on selectively.
+
+          # Promoted to blocking: the workflow files in this repository are
+          # actionlint-clean, so any new GitHub Actions defect is a regression
+          # introduced by the change under review rather than legacy debt.
+          ACTION_ACTIONLINT_DISABLE_ERRORS: false
+
+          # Remaining linters stay non-blocking until their backlog is
+          # triaged. Tracked separately; see the PR description for scope.
           # DISABLE_ERRORS_LINTERS: REPOSITORY_DEVSKIM,REPOSITORY_KICS,REPOSITORY_CHECKOV,POWERSHELL_POWERSHELL,SPELL_CSPELL
 
       # Upload MegaLinter artifacts
       - name: Archive production artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: success() || failure()
         with:
           name: MegaLinter reports
@@ -120,60 +145,53 @@ jobs:
             megalinter-reports
             mega-linter.log
 
-      # Set APPLY_FIXES_IF var for use in future steps
-      - name: Set APPLY_FIXES_IF var
+      # Decide whether linter fixes should be committed back. Guards, in order:
+      # MegaLinter actually changed files; the event matches APPLY_FIXES_EVENT;
+      # the head branch belongs to this repository, so a pull request from a
+      # fork can never reach the authenticated steps below; APPLY_FIXES_MODE is
+      # the commit path (MegaLinter's pull_request mode was removed rather than
+      # left dormant with a write-scoped token); and the target is not a
+      # protected branch.
+      - name: Set APPLY_FIXES_IF_COMMIT var
+        env:
+          # Evaluated into an environment variable instead of being interpolated
+          # into the script, so no expression value is ever parsed as shell code.
+          APPLY_FIXES_IF_COMMIT_VALUE: >-
+            ${{
+              steps.ml.outputs.has_updated_sources == 1 &&
+              (
+                env.APPLY_FIXES_EVENT == 'all' ||
+                env.APPLY_FIXES_EVENT == github.event_name
+              ) &&
+              (
+                github.event_name == 'push' ||
+                github.event.pull_request.head.repo.full_name == github.repository
+              ) &&
+              env.APPLY_FIXES_MODE == 'commit' &&
+              (!contains(fromJSON('["refs/heads/main", "refs/heads/master"]'), github.ref))
+            }}
         run: |
-          printf 'APPLY_FIXES_IF=%s\n' "${{
-            steps.ml.outputs.has_updated_sources == 1 &&
-            (
-              env.APPLY_FIXES_EVENT == 'all' ||
-              env.APPLY_FIXES_EVENT == github.event_name
-            ) &&
-            (
-              github.event_name == 'push' ||
-              github.event.pull_request.head.repo.full_name == github.repository
-            )
-          }}" >> "${GITHUB_ENV}"
-
-      # Set APPLY_FIXES_IF_* vars for use in future steps
-      - name: Set APPLY_FIXES_IF_* vars
-        run: |
-          printf 'APPLY_FIXES_IF_PR=%s\n' "${{
-            env.APPLY_FIXES_IF == 'true' &&
-            env.APPLY_FIXES_MODE == 'pull_request'
-          }}" >> "${GITHUB_ENV}"
-          printf 'APPLY_FIXES_IF_COMMIT=%s\n' "${{
-            env.APPLY_FIXES_IF == 'true' &&
-            env.APPLY_FIXES_MODE == 'commit' &&
-            (!contains(fromJSON('["refs/heads/main", "refs/heads/master"]'), github.ref))
-          }}" >> "${GITHUB_ENV}"
-
-      # Create pull request if applicable
-      # (for now works only on PR from same repository, not from forks)
-      - name: Create Pull Request with applied fixes
-        uses: peter-evans/create-pull-request@4e1beaa7521e8b457b572c090b25bd3db56bf1c5 # v5.0.3
-        id: cpr
-        if: env.APPLY_FIXES_IF_PR == 'true'
-        with:
-          token: ${{ secrets.PAT || secrets.GITHUB_TOKEN }}
-          commit-message: "[MegaLinter] Apply linters automatic fixes"
-          title: "[MegaLinter] Apply linters automatic fixes"
-          labels: bot
-
-      - name: Create PR output
-        if: env.APPLY_FIXES_IF_PR == 'true'
-        run: |
-          echo "PR Number - ${{ steps.cpr.outputs.pull-request-number }}"
-          echo "PR URL - ${{ steps.cpr.outputs.pull-request-url }}"
+          printf 'APPLY_FIXES_IF_COMMIT=%s\n' "${APPLY_FIXES_IF_COMMIT_VALUE}" >> "${GITHUB_ENV}"
 
       # Push new commit if applicable
       # (for now works only on PR from same repository, not from forks)
       - name: Prepare commit
         if: env.APPLY_FIXES_IF_COMMIT == 'true'
-        run: sudo chown -Rc $UID .git/
+        run: sudo chown -Rc "$UID" .git/
+
+      # Credentials are introduced only here, after every linter has finished,
+      # so untrusted pull request content is never linted alongside a usable
+      # push token.
+      - name: Authenticate push remote
+        if: env.APPLY_FIXES_IF_COMMIT == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git remote set-url origin \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
 
       - name: Commit and push applied linter fixes
-        uses: stefanzweifel/git-auto-commit-action@3ea6ae190baf489ba007f7c92608f33ce20ef04a # v4.16.0
+        uses: stefanzweifel/git-auto-commit-action@4a55954c782fc1ea30b9056cd3e7a2b40ca8887d # v7.2.0
         if: env.APPLY_FIXES_IF_COMMIT == 'true'
         with:
           branch: >-
