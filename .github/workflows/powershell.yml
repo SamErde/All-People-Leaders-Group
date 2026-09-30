@@ -11,19 +11,20 @@ name: PSScriptAnalyzer
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
   schedule:
-    - cron: '39 17 * * 2'
+    - cron: "39 17 * * 2"
 
 permissions:
   contents: read
 
-# One analysis run per ref. Superseded runs are cancelled because only the
-# newest SARIF upload is meaningful for a given ref.
+# One analysis run per pull request or ref. Superseded runs are cancelled
+# because only the newest SARIF upload is meaningful. The pull request number
+# is used rather than the branch name, which is not unique across forks.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:

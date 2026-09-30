@@ -38,11 +38,14 @@ env:
   APPLY_FIXES_MODE: commit
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  # Keyed on the pull request number rather than the branch name: fork
+  # branches frequently share names (commonly "main"), which would otherwise
+  # make unrelated pull requests cancel each other.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   # Keep the last run on a protected branch alive so its reports are published;
   # feature-branch runs are safe to supersede.
   cancel-in-progress: >-
-    ${{ !contains(fromJSON('["refs/heads/main", "refs/heads/master"]'), github.ref) }}
+    ${{ !contains(fromJSON('["main", "master"]'), github.ref_name) }}
 
 permissions:
   contents: read
@@ -61,7 +64,6 @@ jobs:
       pull-requests: write # MegaLinter's pull request comment reporter
 
     steps:
-
       # Git Checkout
       - name: Harden the runner (Audit all outbound calls)
         uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
@@ -76,6 +78,11 @@ jobs:
           # push token. Push access is granted later, in a guarded step, only
           # after linting has finished.
           persist-credentials: false
+
+          # Lint exactly the commit the fixes will be applied to. By default a
+          # pull_request checkout is the ephemeral merge commit, so fixes would
+          # be computed against one tree and committed onto a different one.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
           # If you use VALIDATE_ALL_CODEBASE = true, you can remove this line to
           # improve performance
@@ -93,7 +100,6 @@ jobs:
         # All available variables are described in documentation
         # https://megalinter.io/configuration/
         env:
-
           # Validates all source when push on main, else just the git diff with
           # main. Override with true if you always want to lint all sources
           #
@@ -150,11 +156,11 @@ jobs:
       # the head branch belongs to this repository, so a pull request from a
       # fork can never reach the authenticated steps below; APPLY_FIXES_MODE is
       # the commit path (MegaLinter's pull_request mode was removed rather than
-      # left dormant with a write-scoped token); and the target is not a
-      # protected branch.
+      # left dormant with a write-scoped token); and the destination branch is
+      # neither protected nor oddly named.
       - name: Set APPLY_FIXES_IF_COMMIT var
         env:
-          # Evaluated into an environment variable instead of being interpolated
+          # Evaluated into environment variables instead of being interpolated
           # into the script, so no expression value is ever parsed as shell code.
           APPLY_FIXES_IF_COMMIT_VALUE: >-
             ${{
@@ -167,11 +173,30 @@ jobs:
                 github.event_name == 'push' ||
                 github.event.pull_request.head.repo.full_name == github.repository
               ) &&
-              env.APPLY_FIXES_MODE == 'commit' &&
-              (!contains(fromJSON('["refs/heads/main", "refs/heads/master"]'), github.ref))
+              env.APPLY_FIXES_MODE == 'commit'
             }}
+          # The branch the fixes would actually be pushed to. 'github.ref'
+          # cannot be used for this test: on pull_request events it is
+          # 'refs/pull/<n>/merge', which never matches a protected branch ref,
+          # so the protected-branch guard would silently always pass.
+          DEST_BRANCH_VALUE: ${{ github.event.pull_request.head.ref || github.ref_name }}
         run: |
-          printf 'APPLY_FIXES_IF_COMMIT=%s\n' "${APPLY_FIXES_IF_COMMIT_VALUE}" >> "${GITHUB_ENV}"
+          set -euo pipefail
+          apply="${APPLY_FIXES_IF_COMMIT_VALUE}"
+
+          case "${DEST_BRANCH_VALUE}" in
+            main | master)
+              echo "::notice::Refusing to push linter fixes to protected branch '${DEST_BRANCH_VALUE}'."
+              apply=false
+              ;;
+            '' | *[!A-Za-z0-9._/-]*)
+              echo "::notice::Destination branch name is not a plain ref; skipping write-back."
+              apply=false
+              ;;
+          esac
+
+          printf 'APPLY_FIXES_IF_COMMIT=%s\n' "${apply}" >> "${GITHUB_ENV}"
+          printf 'DEST_BRANCH=%s\n' "${DEST_BRANCH_VALUE}" >> "${GITHUB_ENV}"
 
       # Push new commit if applicable
       # (for now works only on PR from same repository, not from forks)
@@ -190,16 +215,42 @@ jobs:
           git remote set-url origin \
             "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
 
+      # The sources that were linted are the merge commit's, but the fixes are
+      # applied on top of the head branch tip. If someone pushed to that branch
+      # while the linters were running, the fixes were computed against code
+      # that no longer exists there, so the write-back is abandoned.
+      - name: Verify destination branch has not moved
+        if: env.APPLY_FIXES_IF_COMMIT == 'true'
+        env:
+          LINTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "${DEST_BRANCH}"
+          remote_sha="$(git rev-parse FETCH_HEAD)"
+          if [ "${remote_sha}" != "${LINTED_SHA}" ]; then
+            echo "::notice::'${DEST_BRANCH}' moved from ${LINTED_SHA} to ${remote_sha} while linting; skipping write-back."
+            printf 'APPLY_FIXES_IF_COMMIT=false\n' >> "${GITHUB_ENV}"
+          fi
+
       - name: Commit and push applied linter fixes
         uses: stefanzweifel/git-auto-commit-action@4a55954c782fc1ea30b9056cd3e7a2b40ca8887d # v7.2.0
         if: env.APPLY_FIXES_IF_COMMIT == 'true'
         with:
-          branch: >-
-            ${{
-              github.event.pull_request.head.ref ||
-              github.head_ref ||
-              github.ref
-            }}
+          branch: ${{ env.DEST_BRANCH }}
+          # Pathspecs, not a glob, hence disable_globbing. Two classes of file
+          # are kept out of this automated, write-token-backed commit:
+          #
+          #   - .github/workflows: a privileged bot must not be able to rewrite
+          #     the definitions of the jobs that grant it that privilege. This
+          #     is also why no PAT is needed here; GITHUB_TOKEN is rejected by
+          #     GitHub when a push touches a workflow file, and nothing else
+          #     about the write-back requires a broader-scoped credential.
+          #   - MegaLinter's own reports and log, which are run artefacts.
+          #
+          # Workflow YAML fixes are therefore reported but never auto-applied;
+          # a human applies them.
+          disable_globbing: true
+          file_pattern: ". :!.github/workflows :!megalinter-reports :!mega-linter.log"
           commit_message: "[MegaLinter] Apply linters fixes"
           commit_user_name: megalinter-bot
           commit_user_email: samuel.erde@gmail.com
