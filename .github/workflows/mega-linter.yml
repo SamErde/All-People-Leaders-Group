@@ -57,11 +57,20 @@ jobs:
     timeout-minutes: 45
 
     # GITHUB_TOKEN scopes, matched to the endpoints actually used.
-    # 'issues: write' was removed: this workflow never touches a standalone
-    # issue, and PR comments are authorised by 'pull-requests: write'.
+    # This job executes every linter, i.e. a large amount of third-party code,
+    # over the contents of the pull request. It therefore holds no write access
+    # to repository contents at all; pushing auto-fixes is the job of the
+    # separate, linter-free 'apply-fixes' job below. 'issues: write' was also
+    # removed: this workflow never touches a standalone issue, and MegaLinter's
+    # pull request comment reporter is authorised by 'pull-requests: write'.
     permissions:
-      contents: write # push auto-fix commits back to the pull request branch
+      contents: read # read the code under review; this job never pushes
       pull-requests: write # MegaLinter's pull request comment reporter
+
+    outputs:
+      apply: ${{ steps.gate.outputs.apply }}
+      dest_branch: ${{ steps.gate.outputs.dest_branch }}
+      linted_sha: ${{ steps.gate.outputs.linted_sha }}
 
     steps:
       # Git Checkout
@@ -154,15 +163,20 @@ jobs:
       # Decide whether linter fixes should be committed back. Guards, in order:
       # MegaLinter actually changed files; the event matches APPLY_FIXES_EVENT;
       # the head branch belongs to this repository, so a pull request from a
-      # fork can never reach the authenticated steps below; APPLY_FIXES_MODE is
+      # fork can never reach the authenticated job below; APPLY_FIXES_MODE is
       # the commit path (MegaLinter's pull_request mode was removed rather than
       # left dormant with a write-scoped token); and the destination branch is
       # neither protected nor oddly named.
-      - name: Set APPLY_FIXES_IF_COMMIT var
+      #
+      # The decision is published as a job output and consumed by the separate
+      # 'apply-fixes' job, which is the only place a write token exists.
+      - name: Evaluate write-back eligibility
+        id: gate
+        if: success() || failure()
         env:
           # Evaluated into environment variables instead of being interpolated
           # into the script, so no expression value is ever parsed as shell code.
-          APPLY_FIXES_IF_COMMIT_VALUE: >-
+          ELIGIBLE: >-
             ${{
               steps.ml.outputs.has_updated_sources == 1 &&
               (
@@ -179,14 +193,15 @@ jobs:
           # cannot be used for this test: on pull_request events it is
           # 'refs/pull/<n>/merge', which never matches a protected branch ref,
           # so the protected-branch guard would silently always pass.
-          DEST_BRANCH_VALUE: ${{ github.event.pull_request.head.ref || github.ref_name }}
+          DEST_BRANCH: ${{ github.event.pull_request.head.ref || github.ref_name }}
+          LINTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
-          apply="${APPLY_FIXES_IF_COMMIT_VALUE}"
+          apply="${ELIGIBLE}"
 
-          case "${DEST_BRANCH_VALUE}" in
+          case "${DEST_BRANCH}" in
             main | master)
-              echo "::notice::Refusing to push linter fixes to protected branch '${DEST_BRANCH_VALUE}'."
+              echo "::notice::Refusing to push linter fixes to protected branch '${DEST_BRANCH}'."
               apply=false
               ;;
             '' | *[!A-Za-z0-9._/-]*)
@@ -195,57 +210,110 @@ jobs:
               ;;
           esac
 
-          printf 'APPLY_FIXES_IF_COMMIT=%s\n' "${apply}" >> "${GITHUB_ENV}"
-          printf 'DEST_BRANCH=%s\n' "${DEST_BRANCH_VALUE}" >> "${GITHUB_ENV}"
+          {
+            printf 'apply=%s\n' "${apply}"
+            printf 'dest_branch=%s\n' "${DEST_BRANCH}"
+            printf 'linted_sha=%s\n' "${LINTED_SHA}"
+          } >> "${GITHUB_OUTPUT}"
 
-      # Push new commit if applicable
-      # (for now works only on PR from same repository, not from forks)
-      - name: Prepare commit
-        if: env.APPLY_FIXES_IF_COMMIT == 'true'
-        run: sudo chown -Rc "$UID" .git/
+  # Applying the fixes is deliberately a separate job. No linter, and no other
+  # third-party code, runs here: the job only checks out the branch, unpacks the
+  # fixed files MegaLinter produced, and commits them. It is consequently the
+  # only job in this workflow that holds a write-scoped token, and the untrusted
+  # linting phase above cannot reach that token.
+  apply-fixes:
+    name: Apply linter fixes
+    needs: megalinter
+    if: needs.megalinter.outputs.apply == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
 
-      # Credentials are introduced only here, after every linter has finished,
-      # so untrusted pull request content is never linted alongside a usable
-      # push token.
+    permissions:
+      contents: write # push the auto-fix commit to the pull request branch
+
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      # Checked out by branch name, not by SHA, so HEAD is attached and can be
+      # pushed.
+      - name: Checkout destination branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.megalinter.outputs.dest_branch }}
+          # Credentials are supplied explicitly below rather than written into
+          # .git/config, so nothing in this job can read them back out of the
+          # checkout.
+          persist-credentials: false
+
       - name: Authenticate push remote
-        if: env.APPLY_FIXES_IF_COMMIT == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git remote set-url origin \
             "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
 
-      # The sources that were linted are the merge commit's, but the fixes are
-      # applied on top of the head branch tip. If someone pushed to that branch
-      # while the linters were running, the fixes were computed against code
-      # that no longer exists there, so the write-back is abandoned.
+      # The fixes were computed against a specific commit. If the branch has
+      # moved since, they no longer describe the code that is there now, so the
+      # write-back is abandoned rather than applied to a different tree.
       - name: Verify destination branch has not moved
-        if: env.APPLY_FIXES_IF_COMMIT == 'true'
+        id: freshness
         env:
-          LINTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          LINTED_SHA: ${{ needs.megalinter.outputs.linted_sha }}
+          DEST_BRANCH: ${{ needs.megalinter.outputs.dest_branch }}
         run: |
           set -euo pipefail
-          git fetch --no-tags --depth=1 origin "${DEST_BRANCH}"
-          remote_sha="$(git rev-parse FETCH_HEAD)"
-          if [ "${remote_sha}" != "${LINTED_SHA}" ]; then
-            echo "::notice::'${DEST_BRANCH}' moved from ${LINTED_SHA} to ${remote_sha} while linting; skipping write-back."
-            printf 'APPLY_FIXES_IF_COMMIT=false\n' >> "${GITHUB_ENV}"
+          current_sha="$(git rev-parse HEAD)"
+          if [ "${current_sha}" != "${LINTED_SHA}" ]; then
+            echo "::notice::'${DEST_BRANCH}' moved from ${LINTED_SHA} to ${current_sha} while linting; skipping write-back."
+            printf 'fresh=false\n' >> "${GITHUB_OUTPUT}"
+          else
+            printf 'fresh=true\n' >> "${GITHUB_OUTPUT}"
           fi
 
-      - name: Commit and push applied linter fixes
-        uses: stefanzweifel/git-auto-commit-action@4a55954c782fc1ea30b9056cd3e7a2b40ca8887d # v7.2.0
-        if: env.APPLY_FIXES_IF_COMMIT == 'true'
+      - name: Download MegaLinter fixed sources
+        if: steps.freshness.outputs.fresh == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          branch: ${{ env.DEST_BRANCH }}
-          # Pathspecs, not a glob, hence disable_globbing. Two classes of file
-          # are kept out of this automated, write-token-backed commit:
-          #
-          #   - .github/workflows: a privileged bot must not be able to rewrite
-          #     the definitions of the jobs that grant it that privilege. This
-          #     is also why no PAT is needed here; GITHUB_TOKEN is rejected by
-          #     GitHub when a push touches a workflow file, and nothing else
-          #     about the write-back requires a broader-scoped credential.
-          #   - MegaLinter's own reports and log, which are run artefacts.
+          name: MegaLinter reports
+          path: ${{ runner.temp }}/megalinter-artifact
+
+      # Unpacked with tar rather than by iterating over paths, so file names
+      # containing spaces, quotes or non-ASCII characters are handled byte for
+      # byte and never re-parsed by a shell. '.github/workflows' is excluded at
+      # this point so no file under it can even reach the working tree: a bot
+      # holding a write token must not be able to rewrite the definitions of
+      # the jobs that grant it that token.
+      - name: Apply fixed sources
+        if: steps.freshness.outputs.fresh == 'true'
+        env:
+          UPDATED_SOURCES: ${{ runner.temp }}/megalinter-artifact/megalinter-reports/updated_sources
+        run: |
+          set -euo pipefail
+          if [ ! -d "${UPDATED_SOURCES}" ]; then
+            echo "::notice::No updated sources in the artifact; nothing to apply."
+            exit 0
+          fi
+          tar -C "${UPDATED_SOURCES}" \
+            --exclude='./.github/workflows' \
+            --exclude='./megalinter-reports' \
+            -cf - . \
+            | tar -C "${GITHUB_WORKSPACE}" -xf -
+          git -C "${GITHUB_WORKSPACE}" status --porcelain
+
+      - name: Commit and push applied linter fixes
+        if: steps.freshness.outputs.fresh == 'true'
+        uses: stefanzweifel/git-auto-commit-action@4a55954c782fc1ea30b9056cd3e7a2b40ca8887d # v7.2.0
+        with:
+          branch: ${{ needs.megalinter.outputs.dest_branch }}
+          # Pathspecs, not a glob, hence disable_globbing. These repeat the
+          # exclusions already applied when unpacking the artifact, so a change
+          # to that step cannot silently widen what gets committed. Excluding
+          # .github/workflows is also why no PAT is needed: GitHub rejects
+          # GITHUB_TOKEN pushes that touch a workflow file, and nothing else
+          # about the write-back requires a broader-scoped credential.
           #
           # Workflow YAML fixes are therefore reported but never auto-applied;
           # a human applies them.
