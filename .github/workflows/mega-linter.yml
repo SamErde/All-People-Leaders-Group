@@ -156,6 +156,13 @@ jobs:
         if: success() || failure()
         with:
           name: MegaLinter reports
+          # Most of this repository's lintable files are dot-prefixed, and the
+          # fixed copies under updated_sources keep their original paths. The
+          # action excludes hidden files by default, which would upload that
+          # directory empty and silently strip every fix the apply-fixes job
+          # depends on. The uploaded paths below contain only MegaLinter's own
+          # output, so nothing sensitive is widened by this.
+          include-hidden-files: true
           path: |
             megalinter-reports
             mega-linter.log
