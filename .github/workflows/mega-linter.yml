@@ -328,4 +328,7 @@ jobs:
           file_pattern: ". :!.github/workflows :!megalinter-reports :!mega-linter.log"
           commit_message: "[MegaLinter] Apply linters fixes"
           commit_user_name: megalinter-bot
-          commit_user_email: samuel.erde@gmail.com
+          # Automated commits are attributed to the bot identity rather than to
+          # a maintainer's personal address: a commit produced by a privileged
+          # job should be traceable to that job, not look like a human review.
+          commit_user_email: megalinter-bot@users.noreply.github.com
